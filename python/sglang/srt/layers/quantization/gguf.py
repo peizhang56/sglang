@@ -40,7 +40,8 @@ _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_npu = is_npu()
 
-if _is_cuda:
+# HIP builds sgl-kernel's GGUF ops only on gfx1151 (wave32); see setup_rocm.py.
+if _is_cuda or _is_hip:
     from sgl_kernel import moe_align_block_size, moe_sum
     from sgl_kernel.quantization import (
         ggml_dequantize,
@@ -65,8 +66,7 @@ elif _is_musa:
 elif _is_npu:
     from gguf import dequantize as gguf_dequantize
 else:
-    if not _is_hip:
-        warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+    warnings.warn(f"Only CUDA, ROCm, MUSA and NPU support GGUF quantization currently.")
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +87,6 @@ class GGUFConfig(QuantizationConfig):
 
     def __init__(self, modules_to_not_convert: list[str] | None = None) -> None:
         super().__init__()
-        if _is_hip:
-            warnings.warn(f"Only CUDA and MUSA support GGUF quantization currently.")
         self.modules_to_not_convert = modules_to_not_convert or []
 
     def __repr__(self) -> str:

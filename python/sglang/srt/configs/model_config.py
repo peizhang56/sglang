@@ -1729,6 +1729,10 @@ class ModelConfig:
             "auto-round-int8",
             "quark_int4fp8_moe",
             "quark_mxfp4",
+            # sgl-kernel builds the ggml_* ops only on gfx1151; every other ROCm
+            # target is wave64 and fails gguf_kernel.cu's warp-size static_assert
+            # (see kernels/aot/setup_rocm.py).
+            "gguf",
         ]
         optimized_quantization_methods = [
             "fp8",

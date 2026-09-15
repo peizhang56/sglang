@@ -441,7 +441,7 @@ def get_available_gpu_memory(
         if empty_cache:
             empty_device_cache(torch.cuda)
         props = torch.cuda.get_device_properties(gpu_id)
-        if props.is_integrated:
+        if props.is_integrated or is_amd_apu():
             # On these devices, which use sysmem as device mem, torch.cuda.mem_get_info()
             # only reports "free" memory, which can be lower than what is actually
             # available due to not including cache memory. So we use the system available
@@ -1046,6 +1046,25 @@ def set_cuda_arch():
         os.environ["FLASHINFER_CUDA_ARCH_LIST"] = (
             f"{arch}{'a' if capability[0] >= 9 else ''}"
         )
+
+
+# RDNA3/3.5 APUs carve their "VRAM" out of system RAM, but ROCm reports
+# is_integrated == 0 for them, so mem_get_info() advertises far more memory than
+# the host physically has (108 GiB on a 47 GiB Strix Halo). Sizing the KV pool
+# off that figure over-commits system RAM and wedges the GPU queue.
+_AMD_APU_ARCHS = ("gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153")
+
+
+@lru_cache(maxsize=1)
+def is_amd_apu() -> bool:
+    """Whether the device is an AMD APU whose device memory is system memory.
+
+    False on every non-HIP build, so callers do not need their own is_hip().
+    """
+    if not torch.version.hip:
+        return False
+    gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+    return any(gfx in gcn_arch for gfx in _AMD_APU_ARCHS)
 
 
 @lru_cache(maxsize=1)

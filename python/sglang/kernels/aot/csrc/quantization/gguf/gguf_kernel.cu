@@ -1,5 +1,6 @@
 // Adatped from
 // https://github.com/vllm-project/vllm/blob/755ed7b05be4743237d3339c4ff8c22bcaae04f4/csrc/quantization/gguf/gguf_kernel.cu
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -17,6 +18,77 @@
 #include "moe.cuh"
 #include "moe_vec.cuh"
 // clang-format off
+
+// mmq.cuh uses the hardcoded WARP_SIZE_GGUF (32) while mmvq.cuh uses WARP_SIZE,
+// which is 64 on any ROCm build without -DSGL_ROCM_WARP_SIZE (utils.h:342-352).
+// They agree only because setup_rocm.py special-cases gfx1151; fail loudly
+// rather than silently producing garbage anywhere else.
+static_assert(
+    WARP_SIZE == WARP_SIZE_GGUF,
+    "GGUF kernels require WARP_SIZE == WARP_SIZE_GGUF (32); this target is wave64");
+
+// Elements per quantization block and packed bytes per block, keyed by the ggml
+// type id. Expressed via the same block structs the kernels index with, so it
+// cannot drift from them the way a copied size table would.
+static bool ggml_block_geometry(int64_t type, int64_t& blck, int64_t& tsz) {
+#define SGL_GGUF_GEOM(id, qk, block_t) \
+  case id:                             \
+    blck = (qk);                       \
+    tsz = sizeof(block_t);             \
+    return true;
+  switch (type) {
+    SGL_GGUF_GEOM(2, QK4_0, block_q4_0)
+    SGL_GGUF_GEOM(3, QK4_1, block_q4_1)
+    SGL_GGUF_GEOM(6, QK5_0, block_q5_0)
+    SGL_GGUF_GEOM(7, QK5_1, block_q5_1)
+    SGL_GGUF_GEOM(8, QK8_0, block_q8_0)
+    SGL_GGUF_GEOM(10, QK_K, block_q2_K)
+    SGL_GGUF_GEOM(11, QK_K, block_q3_K)
+    SGL_GGUF_GEOM(12, QK_K, block_q4_K)
+    SGL_GGUF_GEOM(13, QK_K, block_q5_K)
+    SGL_GGUF_GEOM(14, QK_K, block_q6_K)
+    SGL_GGUF_GEOM(16, QK_K, block_iq2_xxs)
+    SGL_GGUF_GEOM(17, QK_K, block_iq2_xs)
+    SGL_GGUF_GEOM(18, QK_K, block_iq3_xxs)
+    SGL_GGUF_GEOM(19, QK_K, block_iq1_s)
+    SGL_GGUF_GEOM(20, QK4_NL, block_iq4_nl)
+    SGL_GGUF_GEOM(21, QK_K, block_iq3_s)
+    SGL_GGUF_GEOM(22, QK_K, block_iq2_s)
+    SGL_GGUF_GEOM(23, QK_K, block_iq4_xs)
+    SGL_GGUF_GEOM(29, QK_K, block_iq1_m)
+    default:
+      return false;
+  }
+#undef SGL_GGUF_GEOM
+}
+
+// Validates that W really holds `rows x cols` elements of `type`. Without this a
+// mismatched K is an out-of-bounds read: the kernels derive their block count
+// from the caller's col, never from W's actual size.
+static void check_gguf_operands(const torch::Tensor& W, const torch::Tensor& X, int64_t type, int64_t rows) {
+  TORCH_CHECK(W.is_cuda() && X.is_cuda(), "GGUF kernels require CUDA tensors, got W=", W.device(), " X=", X.device());
+  TORCH_CHECK(W.device() == X.device(), "W and X must be on the same device");
+  TORCH_CHECK(W.dim() == 2 && X.dim() == 2, "expected 2-D W and X, got ", W.dim(), "-D and ", X.dim(), "-D");
+  TORCH_CHECK(W.is_contiguous() && X.is_contiguous(), "GGUF kernels require contiguous W and X");
+  TORCH_CHECK(W.size(0) == rows, "W has ", W.size(0), " rows but ", rows, " were requested");
+
+  int64_t blck = 0, tsz = 0;
+  TORCH_CHECK(ggml_block_geometry(type, blck, tsz), "unsupported GGUF type ", type);
+  const int64_t cols = X.size(1);
+  TORCH_CHECK(cols % blck == 0, "K=", cols, " is not a multiple of the type ", type, " block size ", blck);
+  TORCH_CHECK(
+      W.numel() * W.element_size() == rows * (cols / blck) * tsz,
+      "W holds ",
+      W.numel() * W.element_size(),
+      " bytes but K=",
+      cols,
+      " of type ",
+      type,
+      " over ",
+      rows,
+      " rows needs ",
+      rows * (cols / blck) * tsz);
+}
 
 // Q8 gemv
 template <typename scalar_t>
@@ -85,8 +157,12 @@ torch::Tensor ggml_dequantize(
 
   DISPATCH_FLOAT_TYPES(DW.scalar_type(), "ggml_dequantize", [&] {
     auto to_cuda = ggml_get_to_cuda<scalar_t>(type);
+    // ggml_get_to_cuda returns a null *host* pointer for an unknown type, so an
+    // unchecked call is a SIGSEGV rather than a catchable error.
+    TORCH_CHECK(to_cuda != nullptr, "ggml_dequantize: unsupported GGUF type ", type);
     to_cuda((void*)W.data_ptr(), (scalar_t*)DW.data_ptr(), m * n, stream);
   });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   return DW;
 }
@@ -96,6 +172,7 @@ torch::Tensor ggml_mul_mat_vec_a8(
     torch::Tensor X,  // input
     int64_t type,
     int64_t row) {
+  check_gguf_operands(W, X, type, row);
   int col = X.sizes()[1];
   int vecs = X.sizes()[0];
   const int padded = (col + 512 - 1) / 512 * 512;
@@ -184,8 +261,13 @@ torch::Tensor ggml_mul_mat_vec_a8(
         mul_mat_vec_iq1_m_q8_1_cuda<scalar_t>(
             (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
         break;
+      default:
+        TORCH_CHECK(false, "ggml_mul_mat_vec_a8: unsupported GGUF type ", type);
     }
   });
+  // A HIP launch failure is sticky: without this it surfaces at the next CUDA
+  // call, inside an unrelated test.
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return Y;
 }
 
@@ -194,6 +276,7 @@ torch::Tensor ggml_mul_mat_a8(
     torch::Tensor X,  // input
     int64_t type,
     int64_t row) {
+  check_gguf_operands(W, X, type, row);
   int col = X.sizes()[1];
   int padded = (col + 512 - 1) / 512 * 512;
   int batch = X.sizes()[0];
@@ -327,8 +410,13 @@ torch::Tensor ggml_mul_mat_a8(
             row,
             stream);
         break;
+      default:
+        TORCH_CHECK(false, "ggml_mul_mat_a8: unsupported GGUF type ", type);
     }
   });
+  // A HIP launch failure is sticky: without this it surfaces at the next CUDA
+  // call, inside an unrelated test.
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return Y;
 }
 
@@ -533,8 +621,13 @@ torch::Tensor ggml_moe_a8(
             sorted_token_ids.sizes()[0],
             stream);
         break;
+      default:
+        TORCH_CHECK(false, "ggml_moe_a8: unsupported GGUF type ", type);
     }
   });
+  // A HIP launch failure is sticky: without this it surfaces at the next CUDA
+  // call, inside an unrelated test.
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return Y;
 }
 
@@ -804,8 +897,13 @@ torch::Tensor ggml_moe_a8_vec(
             quant_X.stride(0),
             stream);
         break;
+      default:
+        TORCH_CHECK(false, "ggml_moe_a8_vec: unsupported GGUF type ", type);
     }
   });
+  // A HIP launch failure is sticky: without this it surfaces at the next CUDA
+  // call, inside an unrelated test.
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return Y;
 }
 
@@ -832,5 +930,6 @@ int64_t ggml_moe_get_block_size(int64_t type) {
     case 14:
       return MOE_X_Q6_K;
   }
-  return 0;
+  // A zero block size divides by zero at the call site rather than failing here.
+  TORCH_CHECK(false, "ggml_moe_get_block_size: unsupported GGUF type ", type);
 }

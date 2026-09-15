@@ -3146,6 +3146,53 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         return model.eval()
 
 
+# llama.cpp's convert_hf_to_gguf.py routes these model types through
+# LlamaModel.modify_tensors, which permutes q_proj/k_proj rows so GGML's rope reads
+# interleaved pairs; HF keeps the split-half layout. Nothing in the tensor name
+# records it, so an unpermuted load yields fluent but factually wrong text.
+_GGUF_ROPE_PERMUTED_MODEL_TYPES = frozenset({"llama", "mistral", "mixtral"})
+
+
+def _unpermute_gguf_rope_qk(
+    name: str, weight: torch.Tensor, num_heads: int, num_kv_heads: int
+) -> torch.Tensor:
+    if name.endswith((".q_proj.weight", ".q_proj.qweight")):
+        n_head = num_heads
+    elif name.endswith((".k_proj.weight", ".k_proj.qweight")):
+        n_head = num_kv_heads
+    else:
+        return weight
+    # A row permutation, so it is valid on packed quantized bytes: GGUF quantizes
+    # along K within a row, never across rows.
+    return (
+        weight.view(n_head, weight.shape[0] // n_head // 2, 2, -1)
+        .transpose(1, 2)
+        .reshape(weight.shape)
+    )
+
+
+# These model types normalize with GemmaRMSNorm, which scales by (1 + weight);
+# llama.cpp folds that 1 into the exported tensor, so it has to come back out or
+# every norm is off by one and the model emits gibberish. The GDN
+# linear_attn.norm is a plain RMSNorm and is deliberately absent from the
+# suffixes below. A quantized norm would arrive as ".qweight" and so cannot match.
+_GGUF_GEMMA_RMSNORM_MODEL_TYPES = frozenset(
+    {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"}
+)
+_GGUF_GEMMA_RMSNORM_SUFFIXES = (
+    ".input_layernorm.weight",
+    ".post_attention_layernorm.weight",
+    ".q_norm.weight",
+    ".k_norm.weight",
+)
+
+
+def _unfold_gguf_gemma_rmsnorm(name: str, weight: torch.Tensor) -> torch.Tensor:
+    if name == "model.norm.weight" or name.endswith(_GGUF_GEMMA_RMSNORM_SUFFIXES):
+        return weight - 1.0
+    return weight
+
+
 class GGUFModelLoader(BaseModelLoader):
     """
     Model loader that can load GGUF files. This is useful for loading models
@@ -3214,16 +3261,49 @@ class GGUFModelLoader(BaseModelLoader):
         state_dict = dummy_model.state_dict()
 
         gguf_to_hf_name_map = {}
+        unmapped = []
         for hf_name in state_dict:
             name, suffix = hf_name.rsplit(".", 1)
             gguf_name = name_map.get_name(name)
+            if gguf_name is None:
+                # Every miss would otherwise key on the literal "None.<suffix>"
+                # and overwrite the previous one, hiding the gap behind a single
+                # entry. Drop it here and name the params in the warning instead.
+                unmapped.append(hf_name)
+                continue
             gguf_to_hf_name_map[f"{gguf_name}.{suffix}"] = hf_name
+        if unmapped:
+            logger.warning(
+                "No GGUF tensor name for %d parameter(s); they will not be "
+                "loaded. Add a builder to GGUF_HF_NAME_MAP_BUILDERS for %s. "
+                "Unmapped: %s",
+                len(unmapped),
+                model_type,
+                ", ".join(unmapped[:8]),
+            )
         return gguf_to_hf_name_map
 
     def _get_weights_iterator(
-        self, model_name_or_path: str, gguf_to_hf_name_map: Dict[str, str]
+        self,
+        model_name_or_path: str,
+        gguf_to_hf_name_map: Dict[str, str],
+        model_config: ModelConfig,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-        return gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
+        weights = gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
+        config = model_config.hf_config
+        model_type = config.model_type
+        if model_type in _GGUF_ROPE_PERMUTED_MODEL_TYPES:
+            num_heads = config.num_attention_heads
+            num_kv_heads = config.num_key_value_heads
+            weights = (
+                (name, _unpermute_gguf_rope_qk(name, w, num_heads, num_kv_heads))
+                for name, w in weights
+            )
+        if model_type in _GGUF_GEMMA_RMSNORM_MODEL_TYPES:
+            weights = (
+                (name, _unfold_gguf_gemma_rmsnorm(name, w)) for name, w in weights
+            )
+        return weights
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config.model_path)
@@ -3249,7 +3329,9 @@ class GGUFModelLoader(BaseModelLoader):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
             model.load_weights(
-                self._get_weights_iterator(local_model_path, gguf_weights_map)
+                self._get_weights_iterator(
+                    local_model_path, gguf_weights_map, model_config
+                )
             )
 
             for _, module in model.named_modules():

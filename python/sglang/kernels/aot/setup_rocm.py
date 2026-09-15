@@ -75,11 +75,16 @@ if torch.cuda.is_available():
 else:
     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
-if amdgpu_target not in ["gfx942", "gfx950", "gfx1250"]:
+if amdgpu_target not in ["gfx942", "gfx950", "gfx1250", "gfx1151"]:
     print(
         f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942', 'gfx950', or 'gfx1250'."
     )
     sys.exit(1)
+
+# gguf_kernel.cu static_asserts WARP_SIZE == WARP_SIZE_GGUF (32); every other ROCm
+# target is wave64, where that assert would fail the whole extension build.
+if amdgpu_target == "gfx1151":
+    sources.append("csrc/quantization/gguf/gguf_kernel.cu")
 
 fp8_macro = (
     "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
@@ -104,6 +109,8 @@ hipcc_flags = [
     "-DENABLE_FP8",
     fp8_macro,
     f"-DSGL_TOPK_DYNAMIC_SMEM_BYTES={topk_dynamic_smem_bytes}",
+    # gfx1151 is wave32; pin both compiler passes to it (see utils.h below).
+    *(["-DSGL_ROCM_WARP_SIZE=32"] if amdgpu_target == "gfx1151" else []),
 ]
 
 ext_modules = [

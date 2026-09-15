@@ -319,6 +319,68 @@ if _is_npu:
     )
 
 
+def _gguf_gdn_head_perms(num_v_heads: int, num_k_heads: int):
+    """Value-head index maps between llama.cpp's qwen35 export and the FLA kernel.
+
+    The export strides value heads across key-head groups, so export head i
+    belongs to key head ``i % num_k_heads``; the FLA chunk kernel pairs value
+    head j with key head ``j // group``. Returns (export_to_kernel,
+    kernel_to_export).
+    """
+    group = num_v_heads // num_k_heads
+    export_to_kernel = (
+        torch.arange(num_v_heads).view(group, num_k_heads).t().reshape(-1)
+    )
+    kernel_to_export = (
+        torch.arange(num_v_heads).view(num_k_heads, group).t().reshape(-1)
+    )
+    return export_to_kernel, kernel_to_export
+
+
+def _is_gdn_leaf_weight(name: str, module: str) -> bool:
+    # A GGUF checkpoint renames a quantized `weight` to `qweight` and emits a
+    # separate 0-d `qweight_type`, which must not be permuted along with it.
+    return name.endswith(f".{module}.weight") or name.endswith(f".{module}.qweight")
+
+
+def _gguf_gdn_export_fixup(
+    name: str, loaded_weight: torch.Tensor, config: Qwen3_5TextConfig
+) -> torch.Tensor:
+    """Rewrite one GDN tensor from llama.cpp's qwen35 export conventions.
+
+    Two of them differ from HF and neither is visible in the tensor name: value
+    heads are strided across key-head groups, and ssm_a holds -exp(A_log) rather
+    than A_log. in_proj_z and out_proj are deliberately left in export order --
+    out_proj carries the permutation on its quantized K axis, where a 128-column
+    reorder spans quantization blocks and so is not a byte move. Instead
+    Qwen3_5GatedDeltaNet.forward maps the kernel output back onto export order.
+    """
+    if ".linear_attn." not in name:
+        return loaded_weight
+    num_v_heads = config.linear_num_value_heads
+    num_k_heads = config.linear_num_key_heads
+    to_kernel, _ = _gguf_gdn_head_perms(num_v_heads, num_k_heads)
+    to_kernel = to_kernel.to(loaded_weight.device)
+
+    if name.endswith(".linear_attn.A_log"):
+        return torch.log(-loaded_weight[to_kernel].float())
+    if name.endswith(".linear_attn.dt_bias"):
+        return loaded_weight[to_kernel]
+    if _is_gdn_leaf_weight(name, "in_proj_b") or _is_gdn_leaf_weight(name, "in_proj_a"):
+        return loaded_weight[to_kernel]
+    if _is_gdn_leaf_weight(name, "in_proj_qkv") or name.endswith(
+        ".linear_attn.conv1d.weight"
+    ):
+        # Leading rows are q then k, both already in kernel order.
+        key_rows = 2 * num_k_heads * config.linear_key_head_dim
+        value_rows = loaded_weight[key_rows:]
+        permuted = value_rows.view(num_v_heads, -1, *value_rows.shape[1:])[to_kernel]
+        return torch.cat(
+            [loaded_weight[:key_rows], permuted.reshape(value_rows.shape)]
+        )
+    return loaded_weight
+
+
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -347,6 +409,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.head_v_dim = config.linear_value_head_dim
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
+
+        self.gguf_reorder_v_heads = (
+            quant_config is not None and quant_config.get_name() == "gguf"
+        )
+        if self.gguf_reorder_v_heads and self.attn_tp_size != 1:
+            raise NotImplementedError(
+                "GGUF GDN value-head reordering does not support attention TP > 1."
+            )
         self.alt_stream = alt_stream
 
         self.conv_kernel_size = config.linear_conv_kernel_dim
@@ -509,7 +579,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def _bind_packed_weight_loaders(self, module):
         """Bind packed-checkpoint-aware loaders to all relevant params of a merged module."""
-        for attr_name in ("weight", "weight_scale_inv", "weight_scale", "input_scale"):
+        # qweight/qweight_type are GGUF's stand-ins for weight; without them the
+        # (0, 1, 2) tuple shard of in_proj_qkv reaches MergedColumnParallelLinear
+        # .weight_loader, which rejects tuple shard ids.
+        for attr_name in (
+            "weight",
+            "weight_scale_inv",
+            "weight_scale",
+            "input_scale",
+            "qweight",
+            "qweight_type",
+        ):
             param = getattr(module, attr_name, None)
             if param is None:
                 continue
@@ -557,7 +637,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 if loaded_weight.numel() == 1:
                     # Single-element tensor (scalar or [1]):
                     # broadcast to each logical shard.
-                    chunks = [loaded_weight.view(-1)] * len(loaded_shard_id)
+                    if getattr(param, "is_gguf_weight_type", False):
+                        # Its loader writes into param.data[shard], a 0-d element
+                        # that copy_ refuses to broadcast a shape-[1] source into.
+                        chunk = loaded_weight.reshape(())
+                    else:
+                        chunk = loaded_weight.view(-1)
+                    chunks = [chunk] * len(loaded_shard_id)
                 else:
                     split_dim = getattr(param, "output_dim", 0)
                     if _is_cpu:
@@ -899,6 +985,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         else:
             core_attn_out = attn_result
         assert z is not None
+
+        if self.gguf_reorder_v_heads:
+            # llama.cpp tiles the value heads across key heads (export head i ->
+            # key head i % num_k_heads) where HF interleaves them; z and out_proj
+            # below stay in export order, so bring the kernel's value heads back
+            # to it. The permutation is a transpose of the (key head, group)
+            # index pair.
+            head_shape = core_attn_out.shape
+            core_attn_out = (
+                core_attn_out.view(
+                    *head_shape[:-2],
+                    self.num_k_heads,
+                    self.num_v_heads // self.num_k_heads,
+                    head_shape[-1],
+                )
+                .transpose(-3, -2)
+                .reshape(head_shape)
+            )
 
         z_shape_og = z.shape
         # reshape input data into 2D tensor
@@ -1627,6 +1731,7 @@ class Qwen3_5ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.quant_config = quant_config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
 
@@ -1719,6 +1824,10 @@ class Qwen3_5ForCausalLM(nn.Module):
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
             enable_tp=not is_dp_attention_enabled(),
+            # GGUF stores token_embd quantized; without this the embedding keeps
+            # a plain fp16 `weight` and the checkpoint's qweight/qweight_type
+            # have nowhere to land, leaving it at its uninitialized values.
+            quant_config=self.quant_config,
         )
 
     def get_input_embeddings(self):
@@ -1897,6 +2006,9 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        is_gguf = (
+            self.quant_config is not None and self.quant_config.get_name() == "gguf"
+        )
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -1915,6 +2027,14 @@ class Qwen3_5ForCausalLM(nn.Module):
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
             ):
                 continue
+            if name.endswith("linear_attn.conv1d.weight") and loaded_weight.dim() == 2:
+                # [conv_dim, kernel] -> [conv_dim, 1, kernel]. GGUF drops the
+                # singleton channel dim that the param keeps (see __init__).
+                loaded_weight = loaded_weight.unsqueeze(1)
+            if is_gguf:
+                loaded_weight = _gguf_gdn_export_fixup(
+                    name, loaded_weight, self.config
+                )
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
