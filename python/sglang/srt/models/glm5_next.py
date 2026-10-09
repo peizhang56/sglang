@@ -139,10 +139,30 @@ logger = logging.getLogger(__name__)
 # must agree on it.
 _MHC_POST_MULT_VALUE = 2.0
 
-# Conservative cap, not the crossover: at GLM-5.3-Flash's hc_mult=4 and
-# hidden_size=4096 the fusion wins to 16 tokens and reaches parity at 24, with
-# 17-23 unmeasured. Past it the pre-norm GEMM drops mhc_pre's split-K kernel.
-_MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
+# LOCAL PATCH (GLM-5.3-Flash, 8x MI355X): the real crossover is ~2048, not 24.
+#
+# The previous note here said the fusion "wins to 16 tokens and reaches parity at
+# 24", which is why this was 16. Measured with aiter's own harness at exactly our
+# geometry -- op_tests/test_mhc.py -n 4096 -m <M> -d bf16 --fuse_rmsnorm
+# --w_preshuffle_bf16, every correctness check passing (hip_fused_err=0):
+#
+#       m     unfused_us   fused_us   fused gain
+#      12         26.49      20.39       +23.0%
+#      24         29.33      22.07       +24.7%   <- claimed parity; actually +25%
+#      48         29.73      22.60       +24.0%   <- our decode batch, bs12 x 4 draft
+#      96         31.09      24.58       +20.9%
+#     192         34.18      27.52       +19.5%
+#     512         38.57      33.91       +12.1%
+#    2048         68.12      68.53        -0.6%   <- real crossover
+#   16384        441.80     487.65       -10.4%   <- our prefill chunk; must stay unfused
+#
+# The old threshold most likely described the TRITON path: with fuse_rmsnorm the
+# harness reports "skip Triton mhc_post_pre: Triton has no fused RMSNorm", so on
+# this config only the HIP kernel runs, and it keeps winning well past 24.
+#
+# 1024 sits inside the measured win region and below the ~2048 crossover, so
+# decode (48 tokens) fuses and the 14,472-token prefill chunk does not.
+_MHC_FUSED_BOUNDARY_MAX_TOKENS = 1024
 
 
 @torch.compile
