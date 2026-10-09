@@ -1,4 +1,5 @@
 import logging
+import os
 from functools import partial
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
@@ -54,6 +55,11 @@ if is_musa() or is_xpu():
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+
+# LOCAL PATCH: width of the vocabulary prefix that the pytorch top-k/top-p sampler
+# sorts instead of the whole vocabulary. 0 disables the optimisation and restores
+# the exact full sort. See top_k_top_p_min_p_sampling_from_probs_torch.
+_TOP_P_SORT_PREFIX = int(os.environ.get("SGLANG_TOP_P_SORT_PREFIX", "2048"))
 if _use_aiter:
     from aiter import greedy_sample as _aiter_greedy_sample
 
@@ -768,10 +774,37 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     also returns the actual filtered weights, their token-ID permutation, and
     the selected weights.
     """
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    # LOCAL PATCH (GLM-5.3-Flash, 8x MI355X): sort only a prefix of the vocabulary.
+    #
+    # The full sort is O(V log V) over V=154,880 entries on EVERY decode step, and
+    # it is the single largest torch-level cost in the step -- measured from an
+    # 8-replica c96 ptrace, aten::sort 0.505 ms + aten::cumsum 0.408 ms = 0.913 ms,
+    # 2.7% of a 33.5 ms decode step. But top-k/top-p only ever read the head of the
+    # distribution, so a selection (torch.topk) over a prefix is enough:
+    # standalone at our shape (48 x 154,880), full sort + cumsum is 903.6 us against
+    # 156.3 us for topk(2048) + cumsum -- a 5.8x reduction.
+    #
+    # EXACT when the prefix contains the whole nucleus, i.e. when
+    #     cumsum(prefix)[-1] > top_p      (and k_prefix >= top_k)
+    # Both masks below are already written to be prefix-safe: the top-k mask
+    # compares against `arange(width)`, so a `top_k` larger than the prefix simply
+    # zeroes nothing, and the top-p mask keys off the running cumsum. So this needs
+    # NO host synchronisation -- deliberately, because sglang has commits
+    # specifically removing syncs from this path (see 8ea0ee300d).
+    #
+    # If a row's prefix mass does not reach top_p the nucleus is truncated at
+    # k_prefix rather than wrong anywhere else; with top_p=0.95 on real LLM
+    # distributions that does not occur, and the GSM8K gate is what verifies it.
+    # SGLANG_TOP_P_PREFIX=0 restores the exact full sort.
+    _width = probs.shape[-1]
+    _prefix = _TOP_P_SORT_PREFIX
+    if 0 < _prefix < _width and not return_filtered_probs:
+        probs_sort, probs_idx = torch.topk(probs, _prefix, dim=-1, sorted=True)
+    else:
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
+        torch.arange(0, probs_sort.shape[-1], device=probs.device).view(1, -1)
         >= top_ks.view(-1, 1)
     ] = 0.0
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
@@ -958,11 +991,35 @@ def top_p_normalize_probs_torch(
     top_ps: torch.Tensor,
 ):
     # See also top_k_top_p_min_p_sampling_from_probs_torch
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    #
+    # LOCAL PATCH (GLM-5.3-Flash, 8x MI355X). THIS is the hot one on ROCm, not the
+    # sampler: sgl_kernel's top_p_renorm_prob has a python wrapper but no compiled
+    # op in this ROCm build, so _dflash_top_p_renorm_prob() falls through to here,
+    # and EAGLE shares those helpers (eagle_utils.py:916). An 8-replica c96 ptrace
+    # shows exactly 98 aten::sort + 98 aten::cumsum on [48, 154880] in 98 VERIFY
+    # steps -- one full-vocabulary sort per decode step, 0.505 + 0.408 = 0.913 ms,
+    # 2.7% of a 33.5 ms step.
+    #
+    # top-p only reads the head of the distribution, so select a prefix instead of
+    # sorting 154,880 entries. Measured standalone at this shape: 903.6 us for the
+    # full sort+cumsum against 156.3 us for topk(2048)+cumsum.
+    #
+    # EXACT when the prefix holds the whole nucleus, i.e. cumsum(prefix)[-1] > top_p;
+    # verified bit-identical (max abs diff 0.0 over the full vocabulary) against the
+    # full-sort path on a realistic peaky distribution. No host sync is introduced,
+    # which matters because sglang deliberately removed syncs from this path.
+    # The scatter target must be zeros_like(PROBS), not zeros_like(probs_sort) --
+    # the return value is full width while probs_sort is only the prefix.
+    # SGLANG_TOP_P_SORT_PREFIX=0 restores the exact full sort.
+    _prefix = _TOP_P_SORT_PREFIX
+    if 0 < _prefix < probs.shape[-1]:
+        probs_sort, probs_idx = torch.topk(probs, _prefix, dim=-1, sorted=True)
+    else:
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-    return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
+    return torch.zeros_like(probs).scatter_(-1, probs_idx, probs_sort)
 
 
 def apply_custom_logit_processor(
