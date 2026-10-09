@@ -1337,11 +1337,19 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     "backend is enabled."
                 )
             parallel = get_parallel()
+            # LOCAL PATCH (GLM-5.3-Flash MXFP4, 8x MI355X at TP1): admit tp_size 1.
+            # Upstream restricts this to TP4/TP8 as "validated", not as a shape
+            # requirement. At TP1 nothing is sharded, so the shared expert's
+            # intermediate size is 2048 -- identical to a routed expert -- and the
+            # loader already remaps mlp.shared_experts.* into expert slot
+            # n_routed_experts TP-agnostically (glm5_next.py, load_weights). The
+            # quark gate below was replayed offline against this checkpoint and
+            # passes for all 42 MoE layers (tools/check_shared_fusion_gate.py).
             if (
-                parallel.tp_size not in (4, 8)
+                parallel.tp_size not in (1, 4, 8)
                 or parallel.moe_tp_size != parallel.tp_size
             ):
-                return "HIP shared experts fusion is validated only for TP4 and TP8."
+                return "HIP shared experts fusion is validated only for TP1, TP4 and TP8."
             if (
                 getattr(text_config, "model_type", None) != "glm5_next_text"
                 or getattr(text_config, "hidden_size", None) != 4096
