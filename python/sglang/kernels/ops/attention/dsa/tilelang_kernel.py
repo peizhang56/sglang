@@ -71,6 +71,12 @@ def fast_round_scale(amax, fp8_max_inv):
     return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
 
 
+# Token count at or above which the gfx950 fp8 DSA kernel is launched with 128
+# threads instead of 256. Prefill chunks sit far above it, decode batches far
+# below, so the boundary value itself is not sensitive. See tilelang_sparse_fwd.
+_TILELANG_WIDE_BLOCK_TOKENS = 1024
+
+
 @lru_cache(maxsize=8)
 def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
     """
@@ -1377,7 +1383,17 @@ def tilelang_sparse_fwd(
             if q.dtype != kv.dtype:
                 q = q.to(kv.dtype)
             if _is_gfx95_supported:
-                block_I, threads, block_per_cu, cu = 64, 256, 2, 256
+                # threads is shape-dependent on gfx950. Swept at GLM-5.3-Flash's
+                # geometry (heads 64, d_v 256, d_tail 0, topk 2112 = 2048 + kpool
+                # tail), same harness for both points:
+                #     prefill, 14472 tok : 256 -> 7936 us, 128 -> 7183 us  (-9.5%)
+                #     decode,     80 tok : 256 ->   65.4,  128 ->   66.5   (+1.7%)
+                # The long-sequence launch is latency-bound on a 256-thread block
+                # it cannot fill; the short one is not. Weighted by the c96 trace
+                # (main_kernel is 26.2% of prefill, 3.9% of decode) this is about
+                # -0.9% of all GPU time. tools/tune_tilelang_dsa.py reproduces it.
+                threads = 128 if q.shape[0] >= _TILELANG_WIDE_BLOCK_TOKENS else 256
+                block_I, block_per_cu, cu = 64, 2, 256
             else:
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304
             ni = topk // block_I
