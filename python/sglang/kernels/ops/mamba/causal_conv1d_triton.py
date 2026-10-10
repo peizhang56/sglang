@@ -4,11 +4,23 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 # and https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
 
+import os
 from typing import List, Optional, Union
 
 import torch
 import triton
 import triton.language as tl
+
+# BLOCK_M is the token-chunk width of the prefill conv. The kernel needs the
+# preceding `width - 1` tokens for every chunk, so a small BLOCK_M spends a
+# large fraction of its loads on halo: at BLOCK_M=8 and width=4 it reads 11
+# tokens to produce 8 (37% redundant), and it launches seq/8 chunks. That is
+# sized for decode-length sequences; a 14k-token prefill chunk wants a wider
+# block. Overridable so tools/tune_causal_conv1d.py can sweep it.
+_CONV1D_BLOCK_M_SHORT = int(os.environ.get("SGLANG_CONV1D_BLOCK_M_SHORT", "8"))
+_CONV1D_BLOCK_M_LONG = int(os.environ.get("SGLANG_CONV1D_BLOCK_M_LONG", "8"))
+_CONV1D_BLOCK_N = int(os.environ.get("SGLANG_CONV1D_BLOCK_N", "256"))
+_CONV1D_LONG_SEQ = int(os.environ.get("SGLANG_CONV1D_LONG_SEQ", "1024"))
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
@@ -560,8 +572,12 @@ def causal_conv1d_fn(
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
-        BLOCK_M=8,
-        BLOCK_N=256,
+        BLOCK_M=(
+            _CONV1D_BLOCK_M_LONG
+            if max(seq_lens_cpu) >= _CONV1D_LONG_SEQ
+            else _CONV1D_BLOCK_M_SHORT
+        ),
+        BLOCK_N=_CONV1D_BLOCK_N,
         num_stages=2,
     )
     return out
