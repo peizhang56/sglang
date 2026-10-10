@@ -17,9 +17,18 @@ import triton.language as tl
 # tokens to produce 8 (37% redundant), and it launches seq/8 chunks. That is
 # sized for decode-length sequences; a 14k-token prefill chunk wants a wider
 # block. Overridable so tools/tune_causal_conv1d.py can sweep it.
+# Swept at GLM-5.3-Flash's prefill shape (14472 tokens, dim 8192, width 4,
+# bf16, silu), all 18 configs numerically identical:
+#     BLOCK_M=8  BLOCK_N=256  246.6 us   <- the old hardcoded pair
+#     BLOCK_M=8  BLOCK_N=512  191.8 us   -22.2%
+#     BLOCK_M=32 BLOCK_N=512  176.2 us   -28.5%  <- chosen
+# BLOCK_N is the dominant axis. This entry point is prefill/extend only
+# (decode goes through causal_conv1d_update), so the long values cannot
+# regress decode. tools/tune_causal_conv1d.py reproduces the sweep.
 _CONV1D_BLOCK_M_SHORT = int(os.environ.get("SGLANG_CONV1D_BLOCK_M_SHORT", "8"))
-_CONV1D_BLOCK_M_LONG = int(os.environ.get("SGLANG_CONV1D_BLOCK_M_LONG", "8"))
-_CONV1D_BLOCK_N = int(os.environ.get("SGLANG_CONV1D_BLOCK_N", "256"))
+_CONV1D_BLOCK_M_LONG = int(os.environ.get("SGLANG_CONV1D_BLOCK_M_LONG", "32"))
+_CONV1D_BLOCK_N_SHORT = int(os.environ.get("SGLANG_CONV1D_BLOCK_N_SHORT", "256"))
+_CONV1D_BLOCK_N_LONG = int(os.environ.get("SGLANG_CONV1D_BLOCK_N_LONG", "512"))
 _CONV1D_LONG_SEQ = int(os.environ.get("SGLANG_CONV1D_LONG_SEQ", "1024"))
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -577,7 +586,11 @@ def causal_conv1d_fn(
             if max(seq_lens_cpu) >= _CONV1D_LONG_SEQ
             else _CONV1D_BLOCK_M_SHORT
         ),
-        BLOCK_N=_CONV1D_BLOCK_N,
+        BLOCK_N=(
+            _CONV1D_BLOCK_N_LONG
+            if max(seq_lens_cpu) >= _CONV1D_LONG_SEQ
+            else _CONV1D_BLOCK_N_SHORT
+        ),
         num_stages=2,
     )
     return out
