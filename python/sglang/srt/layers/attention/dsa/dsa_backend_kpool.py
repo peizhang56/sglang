@@ -41,6 +41,16 @@ class DeepseekSparseAttnBackendKPoolMixin:
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
+            # Tried adding "aiter" here 2026-10-10 (GLM-5.3-Flash, gfx950,
+            # index_kpool=4). It does not work, but NOT for the reason below:
+            #   1. get_valid_kv_indices did tl.arange(0, topk) on the page-table
+            #      width, which is only a power of 2 when kpool == 1. Fixed in
+            #      kernels/ops/attention/dsa/triton_kernel.py.
+            #   2. The real blocker: _forward_aiter_extend is a DENSE path. It
+            #      receives the full page table (only flashinfer_sparse_mla sets
+            #      page_table_1 = topk_indices), so it allocated num_tokens *
+            #      width int32 = 93.8 GiB OOM on a 14k-token chunk.
+            # Making aiter a sparse prefill backend is a rewrite, not a flag.
             or dsa_impl in ("fa3", "tilelang", "trtllm")
         ):
             return
