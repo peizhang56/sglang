@@ -109,13 +109,18 @@ def _pick_h_per_block(
         decode     80 tok -> 64   (-6.4%)
         decode     12 tok -> 32   (-6.8%; 64 starves the grid and loses)
     """
-    for h in (64, 32, 16):
-        if num_heads % h and num_heads > h:
-            continue
+    # The kernel asserts `num_heads <= h_per_block or num_heads % h_per_block
+    # == 0`, so only tiles satisfying it are candidates -- including for the
+    # fallback. A bare `return 16` trips that assert for a num_heads that is
+    # over 16 and not a multiple of it (24, 40, 56, ...): every tile is skipped
+    # and the fallback is itself unsafe.
+    safe = [h for h in (64, 32, 16) if num_heads <= h or num_heads % h == 0]
+    for h in safe:
         head_blocks = (num_heads + h - 1) // h
         if seq * head_blocks * n_groups >= cu * block_per_cu:
             return h
-    return 16
+    # Nothing fills the grid: take the smallest safe tile, i.e. the most blocks.
+    return safe[-1] if safe else 16
 
 
 @tilelang.jit(pass_configs=pass_configs)
