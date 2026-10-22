@@ -88,6 +88,23 @@ def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
     return 1
 
 
+def _pick_h_per_block(
+    seq: int, num_heads: int, n_groups: int, cu: int, block_per_cu: int
+) -> int:
+    # A smaller head tile multiplies the fp8 partial kernel's gather traffic (see
+    # sparse_mla_fwd_decode_partial_fp8); a larger one shrinks the grid, so take
+    # the largest tile that still holds block_per_cu blocks per CU.
+    # Only tiles satisfying the kernel's `num_heads <= h or num_heads % h == 0`
+    # assert are candidates -- the fallback included.
+    safe = [h for h in (64, 32, 16) if num_heads <= h or num_heads % h == 0]
+    for h in safe:
+        head_blocks = (num_heads + h - 1) // h
+        if seq * head_blocks * n_groups >= cu * block_per_cu:
+            return h
+    # Nothing fills the grid: take the smallest safe tile, i.e. the most blocks.
+    return safe[-1] if safe else 16
+
+
 @tilelang.jit(pass_configs=pass_configs)
 def act_quant_kernel(
     N, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32, round_scale=False
@@ -1091,6 +1108,7 @@ def sparse_mla_fwd_decode_partial_fp8(
     block_I=64,
     inner_iter=1,
     threads=256,
+    h_per_block=16,
 ):
     assert d_v in (256, 512), f"only support d_v=256 or d_v=512, got {d_v}"
     assert topk % block_I == 0, (
@@ -1120,7 +1138,9 @@ def sparse_mla_fwd_decode_partial_fp8(
     else:
         sm_scale = sm_scale * 1.44269504
 
-    h_per_block = 16
+    # The KV gather below indexes indices[b_i, s_i, g_i, ...] with no head
+    # dependence, so the num_heads/h_per_block head-blocks of a token gather
+    # byte-identical rows; a wider tile trades LDS/VGPR for that redundancy.
     # Match bf16 partial behavior: keep fixed 16-head tiles and use
     # sliced T.copy on H0:H1 for tail handling.
     assert num_heads <= h_per_block or num_heads % h_per_block == 0, (
@@ -1382,6 +1402,9 @@ def tilelang_sparse_fwd(
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304
             ni = topk // block_I
             inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
+            h_per_block = _pick_h_per_block(
+                q.shape[0], num_heads, ni // inner_iter, cu, block_per_cu
+            )
             kernel_partial = sparse_mla_fwd_decode_partial_fp8(
                 num_heads,
                 d_v,
@@ -1391,6 +1414,7 @@ def tilelang_sparse_fwd(
                 block_I=block_I,
                 inner_iter=inner_iter,
                 threads=threads,
+                h_per_block=h_per_block,
             )
         else:
             if _is_gfx95_supported:

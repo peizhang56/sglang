@@ -139,10 +139,10 @@ logger = logging.getLogger(__name__)
 # must agree on it.
 _MHC_POST_MULT_VALUE = 2.0
 
-# Conservative cap, not the crossover: at GLM-5.3-Flash's hc_mult=4 and
-# hidden_size=4096 the fusion wins to 16 tokens and reaches parity at 24, with
-# 17-23 unmeasured. Past it the pre-norm GEMM drops mhc_pre's split-K kernel.
-_MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
+# Measured on the HIP kernel (aiter op_tests/test_mhc.py, hc_mult=4, hidden 4096,
+# --fuse_rmsnorm): the fusion wins up to ~2048 tokens and loses past it. 1024 keeps
+# decode fused and a full prefill chunk unfused.
+_MHC_FUSED_BOUNDARY_MAX_TOKENS = 1024
 
 
 @torch.compile
@@ -1337,11 +1337,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     "backend is enabled."
                 )
             parallel = get_parallel()
+            # TP1 qualifies because nothing is sharded there: the shared expert's
+            # intermediate size matches a routed expert's, and load_weights remaps
+            # mlp.shared_experts.* into expert slot n_routed_experts TP-agnostically.
             if (
-                parallel.tp_size not in (4, 8)
+                parallel.tp_size not in (1, 4, 8)
                 or parallel.moe_tp_size != parallel.tp_size
             ):
-                return "HIP shared experts fusion is validated only for TP4 and TP8."
+                return "HIP shared experts fusion is validated only for TP1, TP4 and TP8."
             if (
                 getattr(text_config, "model_type", None) != "glm5_next_text"
                 or getattr(text_config, "hidden_size", None) != 4096

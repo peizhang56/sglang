@@ -41,6 +41,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
+            # "aiter" does not belong in this list: _forward_aiter_extend is a dense
+            # path that receives the full page table rather than topk_indices, so it
+            # OOMs on a long chunk. Admitting it is a rewrite, not a flag.
             or dsa_impl in ("fa3", "tilelang", "trtllm")
         ):
             return

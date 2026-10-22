@@ -1,4 +1,5 @@
 import logging
+import os
 from functools import partial
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
@@ -54,6 +55,10 @@ if is_musa() or is_xpu():
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+
+# Width of the vocabulary prefix the torch top-k/top-p samplers select instead of
+# sorting the whole vocabulary; 0 restores the exact full sort.
+_TOP_P_SORT_PREFIX = int(os.environ.get("SGLANG_TOP_P_SORT_PREFIX", "2048"))
 if _use_aiter:
     from aiter import greedy_sample as _aiter_greedy_sample
 
@@ -768,10 +773,18 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     also returns the actual filtered weights, their token-ID permutation, and
     the selected weights.
     """
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    # top-k/top-p only read the head of the distribution, so select a prefix instead
+    # of sorting all of it; exact while the prefix covers the nucleus, and sync-free
+    # because both masks below key off the prefix width rather than top_k/top_p.
+    _width = probs.shape[-1]
+    _prefix = _TOP_P_SORT_PREFIX
+    if 0 < _prefix < _width and not return_filtered_probs:
+        probs_sort, probs_idx = torch.topk(probs, _prefix, dim=-1, sorted=True)
+    else:
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
+        torch.arange(0, probs_sort.shape[-1], device=probs.device).view(1, -1)
         >= top_ks.view(-1, 1)
     ] = 0.0
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
@@ -958,11 +971,20 @@ def top_p_normalize_probs_torch(
     top_ps: torch.Tensor,
 ):
     # See also top_k_top_p_min_p_sampling_from_probs_torch
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    #
+    # top-p only reads the head of the distribution, so select a prefix instead of
+    # sorting all of it; exact while the prefix covers the nucleus, and sync-free.
+    _prefix = _TOP_P_SORT_PREFIX
+    if 0 < _prefix < probs.shape[-1]:
+        probs_sort, probs_idx = torch.topk(probs, _prefix, dim=-1, sorted=True)
+    else:
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-    return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
+    # zeros_like(probs), not zeros_like(probs_sort): the result is full width while
+    # probs_sort is only the prefix.
+    return torch.zeros_like(probs).scatter_(-1, probs_idx, probs_sort)
 
 
 def apply_custom_logit_processor(

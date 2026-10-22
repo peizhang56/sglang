@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Union
 
 import torch
@@ -9,6 +10,10 @@ import triton
 import triton.language as tl
 
 _BLOCK_SIZE = 1024
+
+# Width of the descending prefix used to find the top-p pivot; 0 = exact full sort.
+# See _top_p_pivots.
+_TOP_P_PIVOT_PREFIX = int(os.environ.get("SGLANG_TOP_P_PIVOT_PREFIX", "2048"))
 
 
 @triton.jit
@@ -89,6 +94,36 @@ def _renorm_from_pivots(probs_fp32: torch.Tensor, pivots: torch.Tensor) -> torch
     return out
 
 
+def _top_p_pivots(probs_fp32: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
+    """Per-row top-p threshold: the smallest prob whose retained mass covers top_p.
+
+    A descending prefix yields the same pivot value as the ascending full sort
+    (cdf_desc[j] > p <=> cdf_asc[i] >= 1-p, with ties still resolved by the
+    `probs >= pivot` mask downstream); rows whose prefix mass misses top_p fall
+    back to pivot 0.0, keeping the whole row without a host sync.
+    """
+    vocab_size = probs_fp32.shape[-1]
+    k = _TOP_P_PIVOT_PREFIX
+    if not 0 < k < vocab_size:
+        sorted_probs = torch.sort(probs_fp32, dim=-1).values
+        cdf = torch.cumsum(sorted_probs, dim=-1)
+        cutoff = torch.searchsorted(
+            cdf, (1.0 - top_ps).unsqueeze(1), right=False
+        ).squeeze(1)
+        cutoff.clamp_(max=vocab_size - 1)
+        return sorted_probs.gather(1, cutoff.unsqueeze(1)).squeeze(1).contiguous()
+
+    top_vals, _ = torch.topk(probs_fp32, k, dim=-1, sorted=True)
+    cdf_desc = torch.cumsum(top_vals, dim=-1)
+    idx = torch.searchsorted(cdf_desc, top_ps.unsqueeze(1), right=True).squeeze(1)
+    idx.clamp_(max=k - 1)
+    pivots = top_vals.gather(1, idx.unsqueeze(1)).squeeze(1)
+    # Prefix mass did not cover top_p -> keep the whole row instead of truncating.
+    return torch.where(
+        cdf_desc[:, -1] > top_ps, pivots, torch.zeros_like(pivots)
+    ).contiguous()
+
+
 def top_p_renorm_probs_triton(
     probs: torch.Tensor, top_p: Union[torch.Tensor, float]
 ) -> torch.Tensor:
@@ -121,13 +156,7 @@ def top_p_renorm_probs_triton(
 
     # Match FlashInfer's threshold semantics: sort ascending, discard the prefix
     # whose cumulative mass is below 1 - p, and retain all ties at the pivot.
-    sorted_probs = torch.sort(probs_fp32, dim=-1).values
-    cdf = torch.cumsum(sorted_probs, dim=-1)
-    cutoff = torch.searchsorted(cdf, (1.0 - top_ps).unsqueeze(1), right=False).squeeze(
-        1
-    )
-    cutoff.clamp_(max=vocab_size - 1)
-    pivots = sorted_probs.gather(1, cutoff.unsqueeze(1)).squeeze(1).contiguous()
+    pivots = _top_p_pivots(probs_fp32, top_ps)
 
     return _renorm_from_pivots(probs_fp32, pivots)
 
